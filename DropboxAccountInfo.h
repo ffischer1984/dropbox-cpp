@@ -16,6 +16,7 @@
 #ifndef __DROPBOX_ACCOUNT_INFO_H__
 #define __DROPBOX_ACCOUNT_INFO_H__
 
+#include <cstdint>
 #include <string>
 #include <sys/types.h>
 
