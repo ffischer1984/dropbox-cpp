@@ -26,6 +26,16 @@ using namespace std;
 using namespace boost::property_tree;
 using namespace boost::property_tree::json_parser;
 
+/**
+ * Parse /2/users/get_current_account response.
+ * {
+ *   "account_id": "dbid:AAH4f...",
+ *   "name": { "display_name": "Franz Ferdinand", ... },
+ *   "email": "franz@dropbox.com",
+ *   "country": "US",
+ *   ...
+ * }
+ */
 void DropboxAccountInfo::readFromJson(DropboxAccountInfo* info, string& json) {
   try {
     stringstream ss;
@@ -34,15 +44,33 @@ void DropboxAccountInfo::readFromJson(DropboxAccountInfo* info, string& json) {
     ptree pt;
     read_json(ss, pt);
 
-    info->referralLink_ = pt.get<string>("referral_link");
-    info->displayName_ = pt.get<string>("display_name");
-    info->uid_ = pt.get<string>("uid");
-    info->country_ = pt.get<string>("country");
-    info->email_ = pt.get<string>("email");
+    info->uid_         = pt.get<string>("account_id");
+    info->displayName_ = pt.get<string>("name.display_name");
+    info->email_       = pt.get<string>("email");
+    info->country_     = pt.get<string>("country", "");
+  } catch (exception& e) {
+    throw DropboxException(MALFORMED_RESPONSE, e.what());
+  }
+}
 
-    info->quotaInfo_.shared = pt.get<uint64_t>("quota_info.shared");
-    info->quotaInfo_.quota = pt.get<uint64_t>("quota_info.quota");
-    info->quotaInfo_.normal = pt.get<uint64_t>("quota_info.normal");
+/**
+ * Parse /2/users/get_space_usage response.
+ * {
+ *   "used": 314159265,
+ *   "allocation": { ".tag": "individual", "allocated": 10000000000 }
+ * }
+ */
+void DropboxAccountInfo::readSpaceUsageFromJson(DropboxAccountInfo* info,
+    string& json) {
+  try {
+    stringstream ss;
+    ss << json;
+
+    ptree pt;
+    read_json(ss, pt);
+
+    info->quotaInfo_.used      = pt.get<uint64_t>("used",                  0);
+    info->quotaInfo_.allocated = pt.get<uint64_t>("allocation.allocated",  0);
   } catch (exception& e) {
     throw DropboxException(MALFORMED_RESPONSE, e.what());
   }
@@ -56,8 +84,12 @@ void DropboxAccountInfo::readJson(string& json) {
   readFromJson(this, json);
 }
 
+void DropboxAccountInfo::readSpaceUsageJson(string& json) {
+  readSpaceUsageFromJson(this, json);
+}
+
 string DropboxAccountInfo::getReferralLink() const {
-  return referralLink_;
+  return "";  // Removed in Dropbox API v2
 }
 
 string DropboxAccountInfo::getDisplayName() const {

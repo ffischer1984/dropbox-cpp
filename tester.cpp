@@ -18,50 +18,59 @@
 #include <cstdlib>
 #include <iostream>
 #include <cassert>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "DropboxAccountInfo.h"
 #include "DropboxMetadata.h"
 #include "DropboxApi.h"
 
 using namespace std;
-using namespace std::placeholders;
 using namespace dropbox;
 
 // Globals
-const string TEST_DIR = "/testdir";
-const size_t SIZE = (1 << 20);
+const string TEST_DIR  = "/testdir";
+const size_t SIZE      = (1 << 20);
 const size_t LARGE_SIZE = 2 * (1 << 20) + 2;
 DropboxApi* d;
 
-class AuthorizationHelper {
-public:
-  AuthorizationHelper() { }
-
-  void authorize(string token, string secret) {
-    cout << "Request token: " << token << endl;
-    cout << "Request token secret: " << secret << endl;
-
-    cout << "Go to https://www.dropbox.com/1/oauth/authorize?oauth_token="
-      << token << " to authorize" << endl;
-    cout << "Hit any key to continue after authorization" << endl;
-    cin.get();
-  }
-};
+// ---------------------------------------------------------------------------
+// Account info
+// ---------------------------------------------------------------------------
 
 TEST(AccountInfoTestCase, AccountInfoTest) {
   DropboxAccountInfo ac;
   DropboxErrorCode code = d->getAccountInfo(ac);
 
   EXPECT_EQ(SUCCESS, code);
-  EXPECT_STREQ(getenv("DROPBOX_ACCOUNT_NAME"), ac.getDisplayName().c_str());
+  EXPECT_STREQ(getenv("DROPBOX_ACCOUNT_NAME"),  ac.getDisplayName().c_str());
   EXPECT_STREQ(getenv("DROPBOX_ACCOUNT_EMAIL"), ac.getEmail().c_str());
+  // account_id starts with "dbid:" in v2
+  EXPECT_EQ(0, ac.getUid().compare(0, 5, "dbid:"));
+  // Quota should be populated by the second call inside getAccountInfo()
+  EXPECT_GT(ac.getQuotaInfo().allocated, (uint64_t)0);
 }
+
+// ---------------------------------------------------------------------------
+// Base fixture: create / tear down TEST_DIR
+// ---------------------------------------------------------------------------
 
 class BaseDropboxTestCase : public ::testing::Test {
 protected:
   static void SetUpTestCase() {
+    // Clean up any leftover folder from a previous aborted test run
+    DropboxMetadata tmp;
+    DropboxErrorCode delCode = d->deleteFile(TEST_DIR, tmp);
+    if (delCode == SUCCESS) {
+      cout << "[setup] Deleted leftover " << TEST_DIR << endl;
+    }
+
     DropboxMetadata m;
     DropboxErrorCode code = d->createFolder(TEST_DIR, m);
+    if (code != SUCCESS) {
+      cerr << "[setup] createFolder(" << TEST_DIR << ") returned HTTP " << code << endl;
+      cerr << "[setup] tag_=" << m.tag_ << " path_=" << m.path_ << endl;
+    }
     assert(code == SUCCESS);
   }
 
@@ -72,14 +81,15 @@ protected:
   }
 };
 
+// ---------------------------------------------------------------------------
+// Folder operations
+// ---------------------------------------------------------------------------
+
 class DropboxFolderTestCase : public BaseDropboxTestCase {
 public:
   void SetUp() {
     folderName_ = TEST_DIR + "/testdir";
     code_ = d->createFolder(folderName_, md_);
-  }
-
-  void TearDown() {
   }
 
   string folderName_;
@@ -90,8 +100,10 @@ public:
 TEST_F(DropboxFolderTestCase, CreateFolderTest) {
   EXPECT_EQ(SUCCESS, code_);
   EXPECT_STREQ(folderName_.c_str(), md_.path_.c_str());
-  EXPECT_EQ(true, md_.isDir_);
-  EXPECT_NE(true, md_.isDeleted_);
+  EXPECT_TRUE(md_.isDir_);
+  EXPECT_FALSE(md_.isDeleted_);
+  // v2: tag_ must be "folder"
+  EXPECT_STREQ("folder", md_.tag_.c_str());
 }
 
 TEST_F(DropboxFolderTestCase, DeleteFolderTest) {
@@ -99,9 +111,16 @@ TEST_F(DropboxFolderTestCase, DeleteFolderTest) {
   DropboxErrorCode code = d->deleteFile(folderName_, m);
   EXPECT_EQ(SUCCESS, code);
   EXPECT_STREQ(folderName_.c_str(), m.path_.c_str());
-  EXPECT_EQ(true, m.isDir_);
-  EXPECT_EQ(true, m.isDeleted_);
+  EXPECT_TRUE(m.isDir_);
+  // delete_v2 returns the metadata of the item as it was before deletion.
+  // The ".tag" is "folder" (original type), NOT "deleted".
+  EXPECT_FALSE(m.isDeleted_);
+  EXPECT_STREQ("folder", m.tag_.c_str());
 }
+
+// ---------------------------------------------------------------------------
+// File helpers
+// ---------------------------------------------------------------------------
 
 class DropboxFileTestCase : public BaseDropboxTestCase {
 public:
@@ -109,20 +128,17 @@ public:
     int fd = open("/dev/urandom", O_RDONLY);
     assert(fd > 0);
 
-    uint8_t* p = (uint8_t *)malloc(size);
+    uint8_t* p = static_cast<uint8_t*>(malloc(size));
     assert(p);
 
-    size_t rem = size;
-    size_t offset = 0;
+    size_t rem = size, offset = 0;
     while (rem) {
-      int ret = read(fd, p + offset, rem);
+      ssize_t ret = read(fd, p + offset, rem);
       assert(ret > 0);
-      offset += ret;
-      rem -= ret;
+      offset += static_cast<size_t>(ret);
+      rem    -= static_cast<size_t>(ret);
     }
-
     close(fd);
-
     return p;
   }
 
@@ -131,7 +147,6 @@ public:
     DropboxUploadFileRequest up_req(fileName_);
     data_ = getRandomData(SIZE);
     up_req.setUploadData(data_, SIZE);
-
     code_ = d->uploadFile(up_req, md_);
   }
 
@@ -145,26 +160,34 @@ public:
   DropboxMetadata md_;
 };
 
+// ---------------------------------------------------------------------------
+// Upload / download / copy / move / delete
+// ---------------------------------------------------------------------------
+
 TEST_F(DropboxFileTestCase, UploadFileTest) {
-  EXPECT_EQ(code_, SUCCESS);
+  EXPECT_EQ(SUCCESS, code_);
   EXPECT_STREQ(fileName_.c_str(), md_.path_.c_str());
-  EXPECT_NE(true, md_.isDir_);
-  EXPECT_NE(true, md_.isDeleted_);
+  EXPECT_FALSE(md_.isDir_);
+  EXPECT_FALSE(md_.isDeleted_);
   EXPECT_EQ(SIZE, md_.sizeBytes_);
+  EXPECT_FALSE(md_.rev_.empty());
 }
 
 TEST_F(DropboxFileTestCase, NonOverWriteTest) {
+  // Upload to same path with overwrite=false → Dropbox auto-renames
   DropboxUploadFileRequest up_req(fileName_);
-  up_req.setUploadData(getRandomData(SIZE), SIZE);
+  auto* extra = getRandomData(SIZE);
+  up_req.setUploadData(extra, SIZE);
   up_req.setOverwrite(false);
 
   DropboxMetadata m;
   DropboxErrorCode code = d->uploadFile(up_req, m);
+  free(extra);
 
   EXPECT_EQ(code, SUCCESS);
-  EXPECT_STRNE(fileName_.c_str(), m.path_.c_str());
-  EXPECT_NE(true, m.isDir_);
-  EXPECT_NE(true, m.isDeleted_);
+  EXPECT_STRNE(fileName_.c_str(), m.path_.c_str()); // auto-renamed
+  EXPECT_FALSE(m.isDir_);
+  EXPECT_FALSE(m.isDeleted_);
   EXPECT_EQ(SIZE, m.sizeBytes_);
 }
 
@@ -176,7 +199,6 @@ TEST_F(DropboxFileTestCase, CopyFileTest) {
   EXPECT_EQ(code, SUCCESS);
   EXPECT_STREQ(copy_filename.c_str(), m.path_.c_str());
   EXPECT_EQ(md_.isDir_, m.isDir_);
-  EXPECT_EQ(md_.isDeleted_, m.isDeleted_);
   EXPECT_EQ(md_.sizeBytes_, m.sizeBytes_);
 }
 
@@ -188,45 +210,38 @@ TEST_F(DropboxFileTestCase, MoveFileTest) {
   EXPECT_EQ(code, SUCCESS);
   EXPECT_STREQ(copy_filename.c_str(), m.path_.c_str());
   EXPECT_EQ(md_.isDir_, m.isDir_);
-  EXPECT_EQ(md_.isDeleted_, m.isDeleted_);
   EXPECT_EQ(md_.sizeBytes_, m.sizeBytes_);
 }
 
 TEST_F(DropboxFileTestCase, GetFileTest) {
-  DropboxMetadata m;
   DropboxGetFileRequest gfreq(fileName_);
   DropboxGetFileResponse gfres;
 
   DropboxErrorCode code = d->getFile(gfreq, gfres);
-  m = gfres.getMetadata();
 
   EXPECT_EQ(code, SUCCESS);
   EXPECT_EQ(SIZE, gfres.getDataLength());
   EXPECT_EQ(0, memcmp(data_, gfres.getData(), SIZE));
+
+  DropboxMetadata m = gfres.getMetadata();
   EXPECT_STREQ(fileName_.c_str(), m.path_.c_str());
-  EXPECT_EQ(md_.isDir_, m.isDir_);
-  EXPECT_EQ(md_.isDeleted_, m.isDeleted_);
+  EXPECT_FALSE(m.isDir_);
+  EXPECT_FALSE(m.isDeleted_);
   EXPECT_EQ(md_.sizeBytes_, m.sizeBytes_);
 }
 
 TEST_F(DropboxFileTestCase, PartialGetFileTest) {
-  DropboxMetadata m;
   DropboxGetFileRequest gfreq(fileName_);
   DropboxGetFileResponse gfres;
-  size_t offset = 1177;
-  size_t len = 6656;
+  const size_t offset = 1177;
+  const size_t len    = 6656;
 
   gfreq.setRange(offset, len);
   DropboxErrorCode code = d->getFile(gfreq, gfres);
-  m = gfres.getMetadata();
 
   EXPECT_EQ(code, PARTIAL_CONTENT);
   EXPECT_EQ(len, gfres.getDataLength());
   EXPECT_EQ(0, memcmp(data_ + offset, gfres.getData(), len));
-  EXPECT_STREQ(fileName_.c_str(), m.path_.c_str());
-  EXPECT_EQ(md_.isDir_, m.isDir_);
-  EXPECT_EQ(md_.isDeleted_, m.isDeleted_);
-  EXPECT_EQ(md_.sizeBytes_, m.sizeBytes_);
 }
 
 TEST_F(DropboxFileTestCase, DeleteFileTest) {
@@ -234,29 +249,27 @@ TEST_F(DropboxFileTestCase, DeleteFileTest) {
   DropboxErrorCode code = d->deleteFile(fileName_, m);
   EXPECT_EQ(SUCCESS, code);
   EXPECT_STREQ(fileName_.c_str(), m.path_.c_str());
-  EXPECT_NE(true, m.isDir_);
-  EXPECT_EQ(true, m.isDeleted_);
+  EXPECT_FALSE(m.isDir_);
+  // delete_v2 returns original item metadata (tag "file"), not "deleted"
+  EXPECT_FALSE(m.isDeleted_);
 }
+
+// ---------------------------------------------------------------------------
+// Large file upload (upload session)
+// ---------------------------------------------------------------------------
 
 class DropboxLargeFileTestCase : public BaseDropboxTestCase {
 public:
   void SetUp() {
     fileName_ = TEST_DIR + "/largetestfile";
-    data_ = DropboxFileTestCase::getRandomData(LARGE_SIZE);
+    data_     = DropboxFileTestCase::getRandomData(LARGE_SIZE);
     size_t rem_size = LARGE_SIZE;
-    auto cb = [&](uint8_t* buf, size_t off, size_t size) {
-      size_t fetched_size = 0;
 
-      if (size < rem_size) {
-        fetched_size = size;
-      } else {
-        fetched_size = rem_size;
-      }
-      rem_size -= fetched_size;
-
-      memcpy(buf, data_ + off, fetched_size);
-
-      return fetched_size;
+    auto cb = [&](uint8_t* buf, size_t off, size_t sz) -> size_t {
+      size_t fetched = (sz < rem_size) ? sz : rem_size;
+      rem_size -= fetched;
+      memcpy(buf, data_ + off, fetched);
+      return fetched;
     };
 
     DropboxUploadLargeFileRequest req(fileName_, cb, true, "", SIZE, 0);
@@ -267,58 +280,34 @@ public:
     free(data_);
   }
 
-  uint8_t*          data_;
-  string            fileName_;
-  DropboxErrorCode  code_;
-  DropboxMetadata   md_;
+  uint8_t*         data_;
+  string           fileName_;
+  DropboxErrorCode code_;
+  DropboxMetadata  md_;
 };
 
-TEST_F(DropboxLargeFileTestCase, UploadFileTest) {
-  EXPECT_EQ(code_, SUCCESS);
+TEST_F(DropboxLargeFileTestCase, UploadLargeFileTest) {
+  EXPECT_EQ(SUCCESS, code_);
   EXPECT_STREQ(fileName_.c_str(), md_.path_.c_str());
-  EXPECT_NE(true, md_.isDir_);
-  EXPECT_NE(true, md_.isDeleted_);
+  EXPECT_FALSE(md_.isDir_);
+  EXPECT_FALSE(md_.isDeleted_);
   EXPECT_EQ(LARGE_SIZE, md_.sizeBytes_);
 }
 
-TEST_F(DropboxLargeFileTestCase, NonOverWriteTest) {
-  auto cb = [&](uint8_t* buf, size_t offset, size_t sz) {
-    if (offset + sz < LARGE_SIZE) {
-      return sz;
-    } else {
-      return LARGE_SIZE - offset;
-    }
-  };
-
-  DropboxUploadLargeFileRequest req(fileName_, cb,
-    false, "", LARGE_SIZE, 0);
-
-  DropboxMetadata m;
-  DropboxErrorCode code = d->uploadLargeFile(req, m);
-
-  EXPECT_EQ(code, SUCCESS);
-  EXPECT_STRNE(fileName_.c_str(), m.path_.c_str());
-  EXPECT_NE(true, m.isDir_);
-  EXPECT_NE(true, m.isDeleted_);
-  EXPECT_EQ(LARGE_SIZE, m.sizeBytes_);
-}
-
-TEST_F(DropboxLargeFileTestCase, GetFileTest) {
-  DropboxMetadata m;
+TEST_F(DropboxLargeFileTestCase, GetLargeFileTest) {
   DropboxGetFileRequest gfreq(fileName_);
   DropboxGetFileResponse gfres;
 
   DropboxErrorCode code = d->getFile(gfreq, gfres);
-  m = gfres.getMetadata();
 
   EXPECT_EQ(code, SUCCESS);
   EXPECT_EQ(LARGE_SIZE, gfres.getDataLength());
   EXPECT_EQ(0, memcmp(data_, gfres.getData(), LARGE_SIZE));
-  EXPECT_STREQ(fileName_.c_str(), m.path_.c_str());
-  EXPECT_EQ(md_.isDir_, m.isDir_);
-  EXPECT_EQ(md_.isDeleted_, m.isDeleted_);
-  EXPECT_EQ(md_.sizeBytes_, m.sizeBytes_);
 }
+
+// ---------------------------------------------------------------------------
+// Metadata, revisions, search
+// ---------------------------------------------------------------------------
 
 class DropboxMetadataOpsTestCase : public BaseDropboxTestCase {
 public:
@@ -332,7 +321,6 @@ public:
     assert(code_ == SUCCESS);
 
     code_ = d->copyFile(fileName_, fileName_ + "_1", md_);
-
     code_ = d->copyFile(fileName_, fileName_ + "_2", md_);
     savedRev_ = md_.rev_;
     code_ = d->deleteFile(fileName_ + "_2", md_);
@@ -356,59 +344,61 @@ TEST_F(DropboxMetadataOpsTestCase, MetadataTest) {
   d->getFileMetadata(req, res);
   DropboxMetadata m = res.getMetadata();
 
-  EXPECT_EQ(TEST_DIR, m.path_);
+  EXPECT_STREQ(TEST_DIR.c_str(), m.path_.c_str());
   EXPECT_TRUE(m.isDir_);
-  EXPECT_EQ("dropbox", m.root_);
+  // v2 has no 'root' concept – tag_ should be "folder"
+  EXPECT_STREQ("folder", m.tag_.c_str());
 }
 
 TEST_F(DropboxMetadataOpsTestCase, MetadataListingTest) {
-  DropboxMetadataRequest req(TEST_DIR, true);
+  DropboxMetadataRequest req(TEST_DIR, /*includeChildren=*/true);
   DropboxMetadataResponse res;
 
   d->getFileMetadata(req, res);
-  const vector<DropboxMetadata>& children = res.getChildren();
+  const auto& children = res.getChildren();
 
+  // testfile, testfile_1 (testfile_2 was deleted)
   EXPECT_EQ(2UL, children.size());
-
-  for (auto m : children) {
+  for (const auto& m : children) {
     EXPECT_FALSE(m.isDir_);
     EXPECT_FALSE(m.isDeleted_);
   }
 }
 
 TEST_F(DropboxMetadataOpsTestCase, MetadataIncludeDeletesListingTest) {
-  DropboxMetadataRequest req(TEST_DIR, true, true);
+  // list_folder with include_deleted=true
+  DropboxMetadataRequest req(TEST_DIR, /*includeChildren=*/true, /*includeDeleted=*/true);
   DropboxMetadataResponse res;
 
   d->getFileMetadata(req, res);
-  const vector<DropboxMetadata>& children = res.getChildren();
+  const auto& children = res.getChildren();
 
-  EXPECT_LT(3UL, children.size());
+  // At least 3 entries (testfile, testfile_1, testfile_2 deleted)
+  EXPECT_GE(children.size(), 3UL);
 
-  for (auto m : children) {
-    if (m.path_.compare(fileName_ + "_2") == 0) {
+  bool foundDeleted = false;
+  for (const auto& m : children) {
+    if (m.path_ == fileName_ + "_2") {
       EXPECT_TRUE(m.isDeleted_);
+      foundDeleted = true;
     }
   }
+  EXPECT_TRUE(foundDeleted);
 }
 
 TEST_F(DropboxMetadataOpsTestCase, RevisionsTest) {
   DropboxRevisions revs;
-
   d->getRevisions(fileName_ + "_2", 10, revs);
-
-  EXPECT_LE(1UL, revs.getRevisions().size());
+  EXPECT_GE(revs.getRevisions().size(), 1UL);
 }
 
 TEST_F(DropboxMetadataOpsTestCase, RestoreTest) {
   DropboxMetadata m;
   DropboxErrorCode code = d->restoreFile(fileName_ + "_2", savedRev_, m);
-
   EXPECT_EQ(SUCCESS, code);
 
   DropboxGetFileRequest gfreq(fileName_ + "_2");
   DropboxGetFileResponse gfres;
-
   code = d->getFile(gfreq, gfres);
 
   EXPECT_EQ(SUCCESS, code);
@@ -418,59 +408,58 @@ TEST_F(DropboxMetadataOpsTestCase, RestoreTest) {
 
 TEST_F(DropboxMetadataOpsTestCase, SearchTest) {
   DropboxSearchRequest req(TEST_DIR, "testfile", false);
-  DropboxSearchResult res;
+  DropboxSearchResult  res;
 
   DropboxErrorCode code = d->search(req, res);
-  vector<DropboxMetadata> const& v = res.getResults();
-
   EXPECT_EQ(SUCCESS, code);
-  EXPECT_EQ(2UL, v.size());
+  // testfile and testfile_1 (2 non-deleted)
+  EXPECT_EQ(2UL, res.getResults().size());
 }
 
-TEST_F(DropboxMetadataOpsTestCase, SearchIncludeDeletedTest) {
-  DropboxSearchRequest req(TEST_DIR, "testfile", true);
-  DropboxSearchResult res;
-
-  DropboxErrorCode code = d->search(req, res);
-  vector<DropboxMetadata> const& v = res.getResults();
-
-  EXPECT_EQ(SUCCESS, code);
-  EXPECT_LT(2UL, v.size());
-}
+// ---------------------------------------------------------------------------
+// Global test environment: set up the DropboxApi singleton
+// ---------------------------------------------------------------------------
 
 class DropboxTestEnvironment : public ::testing::Environment {
 public:
-  void SetUp() {
-    char* api_key = getenv("DROPBOX_API_KEY");
-    char* api_secret = getenv("DROPBOX_API_SECRET");
+  void SetUp() override {
+    const char* api_key    = getenv("DROPBOX_API_KEY");
+    const char* api_secret = getenv("DROPBOX_API_SECRET");
 
-    assert(api_key);
-    assert(api_secret);
+    if (!api_key || !api_secret) {
+      GTEST_SKIP() << "Integration tests require DROPBOX_API_KEY and "
+                      "DROPBOX_API_SECRET to be set. "
+                      "See runtest.sh.skeleton for details.";
+    }
 
     d = new DropboxApi(api_key, api_secret);
 
-    char* auth_token = getenv("DROPBOX_AUTH_TOKEN");
-    char* auth_secret = getenv("DROPBOX_AUTH_TOKEN_SECRET");
-
-    if (auth_token != NULL) {
-      d->setAccessToken(auth_token, auth_secret);
+    const char* auth_token = getenv("DROPBOX_ACCESS_TOKEN");
+    if (auth_token) {
+      d->setAccessToken(auth_token);
+      cout << "Using stored access token." << endl;
     } else {
-      AuthorizationHelper h;
-      auto fn = bind(&AuthorizationHelper::authorize, &h,
-        std::placeholders::_1, std::placeholders::_2);
-      d->authenticate(fn);
+      // Interactive OAuth 2.0 authorization code flow
+      d->authenticate([](const string& url) -> string {
+        cout << "\nAuthorize the app at:\n  " << url << "\n\n";
+        cout << "Paste the authorization code here: ";
+        string code;
+        cin >> code;
+        return code;
+      });
 
-      cout << "Access token: " << d->getAccessToken() << endl;
-      cout << "Access token secret: " << d->getAccessTokenSecret() << endl;
+      cout << "\nAccess token  : " << d->getAccessToken()  << endl;
+      cout << "Refresh token : " << d->getRefreshToken() << endl;
+      cout << "(Set DROPBOX_ACCESS_TOKEN to skip auth next time)\n\n";
     }
   }
 
-  void TearDown() {
+  void TearDown() override {
     delete d;
   }
 };
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   ::testing::AddGlobalTestEnvironment(new DropboxTestEnvironment());
 

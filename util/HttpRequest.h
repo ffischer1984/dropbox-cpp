@@ -137,6 +137,18 @@ public:
                                     const size_t size);
 
   /**
+   * Set a pre-serialized JSON string as the body of a POST request.
+   * When set, Content-Type: application/json is added automatically and
+   * the params map is ignored for the body (params are still appended to
+   * the URL for GET/PUT).
+   *
+   * @param     json    JSON-encoded body string
+   *
+   * @return    void
+   */
+  void                            setJsonBody(const std::string& json);
+
+  /**
    * Dispatch the http request
    *
    * @return    int   The error code returned by curl. 0 on success,
@@ -240,6 +252,8 @@ private:
   size_t                                    requestDataSize_;
   size_t                                    requestDataOffset_;
   uint8_t*                                  requestData_;
+
+  std::string                               jsonBody_;
 
   size_t                                    responseSize_;
   std::unique_ptr<uint8_t, void(*)(void *)> response_;

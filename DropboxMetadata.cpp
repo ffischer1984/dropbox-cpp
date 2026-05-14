@@ -76,6 +76,16 @@ bool DropboxMetadataRequest::includeChildren() const {
 DropboxMetadataResponse::DropboxMetadataResponse() {
 }
 
+/**
+ * Parse a Dropbox API v2 response.
+ *
+ * Two formats are handled:
+ *   - Single-item: the response from /2/files/get_metadata.
+ *     Contains a ".tag" field at the top level.
+ *   - Folder listing: the response from /2/files/list_folder.
+ *     Contains an "entries" array.  Note: pagination ("has_more" + cursor)
+ *     is not yet handled; only the first page of results is returned.
+ */
 void DropboxMetadataResponse::readJson(const string& json) {
   try {
     stringstream ss;
@@ -84,13 +94,15 @@ void DropboxMetadataResponse::readJson(const string& json) {
     ptree pt;
     read_json(ss, pt);
 
-    DropboxMetadata::readFromJson(pt, metadata_);
-    if (pt.count("contents") == 0) {
-      return;
+    if (pt.count("entries")) {
+      // list_folder response: populate children from the "entries" array
+      // The metadata_ field is left default (an "empty" folder placeholder).
+      auto& entries = pt.get_child("entries");
+      DropboxMetadata::readMetadataListFromJson(entries, children_);
+    } else {
+      // get_metadata response: single item
+      DropboxMetadata::readFromJson(pt, metadata_);
     }
-
-    DropboxMetadata::readMetadataListFromJson(
-      pt.get_child("contents"), children_);
   } catch (exception& e) {
     throw DropboxException(MALFORMED_RESPONSE, e.what());
   }
@@ -103,4 +115,3 @@ DropboxMetadata& DropboxMetadataResponse::getMetadata() {
 const vector<DropboxMetadata>& DropboxMetadataResponse::getChildren() const {
   return children_;
 }
-

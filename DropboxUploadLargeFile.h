@@ -17,19 +17,34 @@
 #define __DROPBOX_UPLOAD_LARGE_FILE_H__
 
 #include <string>
+#include <functional>
 
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/json_parser.hpp>
 
 namespace dropbox {
 
+/**
+ * Request parameters for uploadLargeFile().
+ *
+ * The callback (dataCb_) is invoked repeatedly to retrieve chunks of the
+ * file data.  It receives (buffer, offset, maxSize) and must return the
+ * number of bytes written into buffer (0 = end of data, <0 = error).
+ *
+ * Dropbox API v2 uses a three-step upload-session protocol:
+ *   1. upload_session/start  – open session, upload first chunk
+ *   2. upload_session/append_v2 – upload subsequent chunks
+ *   3. upload_session/finish – commit with destination path & mode
+ *
+ * Chunk size recommendation: 150 MB max per chunk; default is 4 MB.
+ */
 class DropboxUploadLargeFileRequest {
 public:
   DropboxUploadLargeFileRequest(const std::string path,
-    std::function<size_t(uint8_t*, size_t, size_t)> cb, // 4MB
+    std::function<size_t(uint8_t*, size_t, size_t)> cb, // data callback
     const bool overwrite = true,
     const std::string parent_rev = "",
-    size_t chunkSize = (1UL << 22),
+    size_t chunkSize = (1UL << 22),  // 4 MB default
     size_t offset = 0) :
       path_(path),
       dataCb_(cb),
@@ -39,55 +54,40 @@ public:
       offset_(offset) {
   }
 
-  void setOverwrite(bool overwrite) {
-    overwrite_ = overwrite;
-  }
+  void setOverwrite(bool overwrite)               { overwrite_  = overwrite;  }
+  void setParentRev(const std::string parent_rev) { parentRev_  = parent_rev; }
+  void setOffset(size_t offset)                   { offset_     = offset;     }
 
-  void setParentRev(const std::string parent_rev) {
-    parentRev_ = parent_rev;
-  }
-
-  void setOffset(size_t offset) {
-    offset_ = offset;
-  }
-
-  std::string getPath() const {
-    return path_;
-  }
-
-  bool shouldOverwrite() const {
-    return overwrite_;
-  }
-
-  std::string getParentRev() const {
-    return parentRev_;
-  }
-
-  size_t getChunkSize() const {
-    return chunkSize_;
-  }
-
-  size_t getOffset() const {
-    return offset_;
-  }
+  std::string getPath()       const { return path_;       }
+  bool shouldOverwrite()      const { return overwrite_;   }
+  std::string getParentRev()  const { return parentRev_;   }
+  size_t getChunkSize()       const { return chunkSize_;   }
+  size_t getOffset()          const { return offset_;      }
 
   size_t getData(uint8_t* data, size_t offset, size_t size) const {
     return dataCb_(data, offset, size);
   }
 
 private:
-  const std::string   path_;
+  const std::string                               path_;
   std::function<size_t(uint8_t*, size_t, size_t)> dataCb_;
-
-  bool                overwrite_;
-  std::string         parentRev_;
-  size_t              chunkSize_;
-  size_t              offset_;
+  bool                                            overwrite_;
+  std::string                                     parentRev_;
+  size_t                                          chunkSize_;
+  size_t                                          offset_;
 };
 
-class DropboxUploadLargeFileResponse {
+/**
+ * Response from upload_session/start and upload_session/append_v2.
+ *
+ * v2 cursor:
+ * { "session_id": "1234faaf0678bcde", "offset": 4194304 }
+ *
+ * (v1 had upload_id + expires; replaced by session_id in v2.)
+ */
+class DropboxUploadSessionCursor {
 public:
-  static DropboxUploadLargeFileResponse readFromJson(std::string response) {
+  static DropboxUploadSessionCursor readFromJson(const std::string& response) {
     using namespace boost::property_tree;
     using namespace boost::property_tree::json_parser;
     using namespace std;
@@ -98,37 +98,26 @@ public:
     ptree pt;
     read_json(s, pt);
 
-    string upId = pt.get<string>("upload_id");
-    size_t offset = pt.get<size_t>("offset");
-    string expiry = pt.get<string>("expires");
+    string sessionId = pt.get<string>("session_id");
+    size_t offset    = pt.get<size_t>("offset", 0);
 
-    return DropboxUploadLargeFileResponse(upId, offset, expiry);
+    return DropboxUploadSessionCursor(sessionId, offset);
   }
 
-  std::string getUploadId() const {
-    return uploadId_;
-  }
-
-  size_t getOffset() const {
-    return offset_;
-  }
-
-  std::string getExpiry() const {
-    return expiry_;
-  }
+  std::string getSessionId() const { return sessionId_; }
+  size_t      getOffset()    const { return offset_;     }
 
 private:
-  DropboxUploadLargeFileResponse(std::string upId,
-    size_t offset,
-    std::string expiry) :
-      uploadId_(upId),
-      offset_(offset),
-      expiry_(expiry) {
+  DropboxUploadSessionCursor(std::string sessionId, size_t offset) :
+    sessionId_(sessionId), offset_(offset) {
   }
 
-  const std::string   uploadId_;
-  const size_t        offset_;
-  const std::string   expiry_;
+  const std::string sessionId_;
+  const size_t      offset_;
 };
-}
+
+// Backward-compatible alias (v1 code referenced DropboxUploadLargeFileResponse)
+using DropboxUploadLargeFileResponse = DropboxUploadSessionCursor;
+
+} // namespace dropbox
 #endif

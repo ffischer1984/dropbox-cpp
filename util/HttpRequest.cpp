@@ -23,6 +23,7 @@
 #include <sstream>
 #include <cstring>
 #include <cassert>
+#include <algorithm>
 
 using namespace http;
 using namespace std;
@@ -32,9 +33,16 @@ HttpRequest::HttpRequest(HttpRequestFactory* factory,
     HttpRequestMethod method) : factory_(factory),
       url_(url),
       method_(method),
+      hasRange_(false),
+      rangeStart_(0),
+      rangeEnd_(0),
+      requestDataSize_(0),
       requestDataOffset_(0),
       requestData_(NULL),
+      jsonBody_(),
+      responseSize_(0),
       response_(NULL, free),
+      responseCode_(0),
       curl_(curl_easy_init(), curl_easy_cleanup),
       slist_(NULL, curl_slist_free_all) {
   factory_->increaseRequestCount();
@@ -84,6 +92,10 @@ void HttpRequest::setRequestData(uint8_t* const data, const size_t sz) {
   requestDataOffset_ = 0;
 }
 
+void HttpRequest::setJsonBody(const std::string& json) {
+  jsonBody_ = json;
+}
+
 size_t HttpRequest::writeFunction(char* buf, size_t size, size_t n, void *p) {
   size_t numBytes = size * n;
   HttpRequest* r = (HttpRequest *)p;
@@ -130,6 +142,9 @@ size_t HttpRequest::headerFunction(char* buf, size_t sz, size_t n, void *p) {
   if (pos != string::npos) {
     header = s.substr(0, pos);
     val = s.substr(pos + 1);
+    // Normalize header name to lowercase for case-insensitive lookup.
+    // HTTP/2 always sends headers in lowercase; HTTP/1.1 is case-insensitive.
+    transform(header.begin(), header.end(), header.begin(), ::tolower);
   } else {
     header = s;
     val = "";
@@ -161,23 +176,6 @@ int HttpRequest::execute() {
 
   responseSize_ = 0;
 
-  // Set the headers
-  vector<string> headerstrings;
-  for (auto i : headers_) {
-    stringstream ss;
-    ss << i.first << ": " << i.second;
-
-    headerstrings.push_back(ss.str());
-  }
-
-  for (auto i : headerstrings) {
-    slist_.reset(curl_slist_append(slist_.get(), i.c_str()));
-  }
-
-  if ((ret = curl_easy_setopt(curl_.get(), CURLOPT_HTTPHEADER, slist_.get()))) {
-    return ret;
-  }
-
   // Set the params
   string paramList;
   bool empty = true;
@@ -196,6 +194,38 @@ int HttpRequest::execute() {
         paramList += ss.str();
       }
     }
+  }
+
+  // Inject Content-Type header for JSON body POSTs before building slist
+  if (method_ == HttpPostRequest && !jsonBody_.empty()) {
+    headers_["Content-Type"] = "application/json";
+  }
+
+  // Set the headers
+  vector<string> headerstrings;
+  for (auto i : headers_) {
+    stringstream ss;
+    ss << i.first << ": " << i.second;
+
+    headerstrings.push_back(ss.str());
+  }
+
+  for (auto i : headerstrings) {
+    // Use release()+reset() to avoid the unique_ptr::reset(same_ptr) pitfall:
+    // curl_slist_append returns the same head pointer when the list is non-empty,
+    // so reset(same_ptr) would free the list and leave a dangling pointer.
+    struct curl_slist* old_slist = slist_.release();
+    struct curl_slist* new_slist = curl_slist_append(old_slist, i.c_str());
+    if (!new_slist) {
+      // append failed – restore old list and bail
+      slist_.reset(old_slist);
+      return CURLE_OUT_OF_MEMORY;
+    }
+    slist_.reset(new_slist);
+  }
+
+  if ((ret = curl_easy_setopt(curl_.get(), CURLOPT_HTTPHEADER, slist_.get()))) {
+    return ret;
   }
 
   string url = url_;
@@ -234,14 +264,51 @@ int HttpRequest::execute() {
       break;
 
     case HttpPostRequest:
-      if ((ret = curl_easy_setopt(curl_.get(), CURLOPT_POST, 1))) {
-        return ret;
-      }
-
-      if ((ret = curl_easy_setopt(curl_.get(),
-          CURLOPT_POSTFIELDS,
-          paramList.c_str()))) {
-        return ret;
+      if (!jsonBody_.empty()) {
+        // JSON body – used by Dropbox API v2 RPC endpoints
+        headers_["Content-Type"] = "application/json";
+        if ((ret = curl_easy_setopt(curl_.get(), CURLOPT_POST, 1L))) {
+          return ret;
+        }
+        if ((ret = curl_easy_setopt(curl_.get(),
+            CURLOPT_POSTFIELDSIZE,
+            (long)jsonBody_.size()))) {
+          return ret;
+        }
+        if ((ret = curl_easy_setopt(curl_.get(),
+            CURLOPT_POSTFIELDS,
+            jsonBody_.c_str()))) {
+          return ret;
+        }
+      } else if (requestData_) {
+        // Binary POST body – used by Dropbox API v2 content endpoints
+        // (e.g. /2/files/upload). API args are passed in a separate header.
+        if ((ret = curl_easy_setopt(curl_.get(), CURLOPT_POST, 1L))) {
+          return ret;
+        }
+        if ((ret = curl_easy_setopt(curl_.get(),
+            CURLOPT_POSTFIELDSIZE_LARGE,
+            (curl_off_t)requestDataSize_))) {
+          return ret;
+        }
+        if ((ret = curl_easy_setopt(curl_.get(),
+            CURLOPT_READFUNCTION,
+            &HttpRequest::readFunction))) {
+          return ret;
+        }
+        if ((ret = curl_easy_setopt(curl_.get(), CURLOPT_READDATA, this))) {
+          return ret;
+        }
+      } else {
+        // Legacy URL-encoded POST (retained for backward compatibility)
+        if ((ret = curl_easy_setopt(curl_.get(), CURLOPT_POST, 1))) {
+          return ret;
+        }
+        if ((ret = curl_easy_setopt(curl_.get(),
+            CURLOPT_POSTFIELDS,
+            paramList.c_str()))) {
+          return ret;
+        }
       }
       break;
 
@@ -280,8 +347,8 @@ int HttpRequest::execute() {
     return ret;
   }
 
-  // Range
-  if (hasRange_) {
+  // Range (GET requests only — for POST/content endpoints use addHeader("Range",...))
+  if (hasRange_ && method_ == HttpGetRequest) {
     stringstream ss;
     ss << rangeStart_ << "-" << rangeEnd_;
 

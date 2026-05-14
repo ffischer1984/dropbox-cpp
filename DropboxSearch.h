@@ -16,37 +16,36 @@
 #ifndef __DROPBOX_SEARCH_H__
 #define __DROPBOX_SEARCH_H__
 
-#include <DropboxMetadataType.h>
+#include "DropboxMetadataType.h"
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/json_parser.hpp>
+#include <boost/foreach.hpp>
 
+/**
+ * Request for DropboxApi::search().
+ *
+ * Maps to /2/files/search_v2:
+ *   { "query": "...", "options": { "path": "...", "max_results": N,
+ *                                  "include_highlights": false } }
+ *
+ * Note: "include_deleted" is no longer part of v2 search options.
+ */
 class DropboxSearchRequest {
 public:
   DropboxSearchRequest(std::string path,
     std::string query,
     bool include_deleted,
-    size_t limit = 1000) :
+    size_t limit = 100) :
       path_(path),
       query_(query),
       includeDeleted_(include_deleted),
       limit_(limit) {
   }
 
-  std::string getSearchPath() const {
-    return path_;
-  }
-
-  std::string getSearchQuery() const {
-    return query_;
-  }
-
-  size_t getResultLimit() const {
-    return limit_;
-  }
-
-  bool shouldIncludeDeleted() const {
-    return includeDeleted_;
-  }
+  std::string getSearchPath()    const { return path_;           }
+  std::string getSearchQuery()   const { return query_;          }
+  size_t      getResultLimit()   const { return limit_;          }
+  bool        shouldIncludeDeleted() const { return includeDeleted_; }
 
 private:
   const std::string   path_;
@@ -55,10 +54,24 @@ private:
   const size_t        limit_;
 };
 
+/**
+ * Result from DropboxApi::search().
+ *
+ * v2 /2/files/search_v2 response:
+ * {
+ *   "matches": [
+ *     { "metadata": { ".tag": "metadata", "metadata": { <file metadata> } } },
+ *     ...
+ *   ],
+ *   "has_more": false,
+ *   "cursor": "..."
+ * }
+ *
+ * Only the first page is returned; pagination is not yet implemented.
+ */
 class DropboxSearchResult {
 public:
-  DropboxSearchResult() {
-  }
+  DropboxSearchResult() { }
 
   static DropboxSearchResult readFromJson(const std::string& json) {
     using namespace std;
@@ -73,7 +86,19 @@ public:
     read_json(ss, pt);
 
     vector<DropboxMetadata> v;
-    DropboxMetadata::readMetadataListFromJson(pt, v);
+    if (pt.count("matches")) {
+      BOOST_FOREACH(ptree::value_type& match, pt.get_child("matches")) {
+        // matches[].metadata.metadata holds the actual file metadata
+        auto metaOpt = match.second.get_child_optional("metadata.metadata");
+        if (metaOpt) {
+          DropboxMetadata m;
+          DropboxMetadata::readFromJson(*metaOpt, m);
+          // Only include non-deleted results unless inherit the old
+          // "include_deleted" semantics (handled server-side in v2).
+          v.push_back(m);
+        }
+      }
+    }
 
     return DropboxSearchResult(v);
   }
@@ -83,11 +108,11 @@ public:
   }
 
 private:
-  DropboxSearchResult(const std::vector<dropbox::DropboxMetadata>& res) :
+  explicit DropboxSearchResult(const std::vector<dropbox::DropboxMetadata>& res) :
     results_(res) {
   }
 
-  std::vector<dropbox::DropboxMetadata>  results_;
+  std::vector<dropbox::DropboxMetadata> results_;
 };
 
 #endif

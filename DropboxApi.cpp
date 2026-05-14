@@ -14,7 +14,6 @@
 */
 
 #include "DropboxApi.h"
-
 #include "util/HttpRequest.h"
 
 #include <boost/property_tree/ptree.hpp>
@@ -24,464 +23,539 @@
 #include <cassert>
 
 using namespace dropbox;
-using namespace oauth;
 using namespace http;
 using namespace std;
 
 using namespace boost::property_tree;
 using namespace boost::property_tree::json_parser;
 
-DropboxApi::DropboxApi(string appKey, string appSecret) {
+// Dropbox API v2 base URLs
+// NOTE: content endpoint uses content.dropboxapi.com (NOT content.dropbox.com)
+static const char* kApiBase     = "https://api.dropbox.com/2";
+static const char* kContentBase = "https://content.dropboxapi.com/2";
+
+// ---------------------------------------------------------------------------
+// Construction
+// ---------------------------------------------------------------------------
+
+DropboxApi::DropboxApi(const string& clientId, const string& clientSecret) {
   httpFactory_ = HttpRequestFactory::createFactory();
-
   lock_guard<mutex> g(stateLock_);
-  oauth_.reset(new OAuth(appKey, appSecret));
-  root_ = DROPBOX_ROOT;
+  auth_.reset(new DropboxAuth(clientId, clientSecret));
 }
 
-DropboxApi::DropboxApi(string appKey,
-    string appSecret,
-    string accessToken,
-    string tokenSecret) {
+DropboxApi::DropboxApi(const string& clientId,
+    const string& clientSecret,
+    const string& accessToken) {
   httpFactory_ = HttpRequestFactory::createFactory();
-
   lock_guard<mutex> g(stateLock_);
-  oauth_.reset(new OAuth(appKey, appSecret));
-  oauth_->setAccessToken(accessToken);
-  oauth_->setAccessTokenSecret(tokenSecret);
+  auth_.reset(new DropboxAuth(clientId, clientSecret));
+  auth_->setAccessToken(accessToken);
 }
 
-void DropboxApi::authenticate(function<void(const string, const string)> cb) {
+// ---------------------------------------------------------------------------
+// Authentication
+// ---------------------------------------------------------------------------
+
+void DropboxApi::authenticate(
+    function<string(const string& authUrl)> cb) {
   lock_guard<mutex> g(stateLock_);
-
-  oauth_->fetchRequestToken("https://api.dropbox.com/1/oauth/request_token");
-
-  cb(oauth_->getRequestToken(), oauth_->getRequestTokenSecret());
-
-  oauth_->fetchAccessToken("https://api.dropbox.com/1/oauth/access_token");
+  string url  = auth_->getAuthorizationUrl("", "", /*requestOffline=*/true);
+  string code = cb(url);
+  auth_->exchangeCode(code);
 }
 
-void DropboxApi::setAccessToken(string token, string secret) {
+void DropboxApi::setAccessToken(const string& token) {
   lock_guard<mutex> g(stateLock_);
-  oauth_->setAccessToken(token);
-  oauth_->setAccessTokenSecret(secret);
+  auth_->setAccessToken(token);
 }
 
-string DropboxApi::getAccessToken() {
+string DropboxApi::getAccessToken() const {
   lock_guard<mutex> g(stateLock_);
-  return oauth_->getAccessToken();
+  return auth_->getAccessToken();
 }
 
-string DropboxApi::getAccessTokenSecret() {
+void DropboxApi::setRefreshToken(const string& token) {
   lock_guard<mutex> g(stateLock_);
-  return oauth_->getAccessTokenSecret();
+  auth_->setRefreshToken(token);
 }
 
-void DropboxApi::setRoot(const string root) {
+string DropboxApi::getRefreshToken() const {
   lock_guard<mutex> g(stateLock_);
-  root_ = root;
+  return auth_->getRefreshToken();
 }
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
 
 DropboxErrorCode DropboxApi::execute(shared_ptr<HttpRequest> r) {
   int ret;
-
   {
     lock_guard<mutex> g(stateLock_);
-    oauth_->addOAuthAccessHeader(r.get());
+    auth_->addBearerHeader(r.get());
   }
-
   if ((ret = r->execute())) {
     stringstream ss;
     ss << "Curl error (code = " << ret << ")";
-
     throw DropboxException(CURL_ERROR, ss.str());
   }
-
-  return (DropboxErrorCode)r->getResponseCode();
+  return static_cast<DropboxErrorCode>(r->getResponseCode());
 }
+
+// Parse a v2 response whose metadata lives under a named sub-key,
+// e.g. delete_v2 / copy_v2 / move_v2 / create_folder_v2 return
+// { "metadata": { ... } }.
+void DropboxApi::parseWrappedMetadata(const string& json,
+    const string& key, DropboxMetadata& m) {
+  stringstream ss;
+  ss << json;
+  ptree pt;
+  read_json(ss, pt);
+  auto child = pt.get_child(key);
+  DropboxMetadata::readFromJson(child, m);
+}
+
+// ---------------------------------------------------------------------------
+// Account
+// ---------------------------------------------------------------------------
 
 DropboxErrorCode DropboxApi::getAccountInfo(DropboxAccountInfo& info) {
-  shared_ptr<HttpRequest> r(
-    httpFactory_->createHttpRequest("https://api.dropbox.com/1/account/info"));
-
-  DropboxErrorCode code = execute(r);
-
-  if (code == SUCCESS) {
-    string response((char *)r->getResponse(), r->getResponseSize());
-    info.readJson(response);
-  }
-
-  return code;
-}
-
-DropboxErrorCode DropboxApi::getFileMetadata(DropboxMetadataRequest& req,
-    DropboxMetadataResponse& res) {
-  stringstream ss;
-  ss << "https://api.dropbox.com/1/metadata/" << root_ << "/" << req.path();
-
-  shared_ptr<HttpRequest> r(httpFactory_->createHttpRequest(ss.str()));
-
-  r->setMethod(HttpGetRequest);
-
-  r->addIntegerParam("file_limit", req.getLimit());
-
-  if (req.getHash().compare("")) {
-    r->addParam("hash", req.getHash());
-  }
-
-  if (req.includeChildren()) {
-    r->addParam("list", "true");
-  } else {
-    r->addParam("list", "false");
-  }
-
-  if (req.includeDeleted()) {
-    r->addParam("include_deleted", "true");
-  } else {
-    r->addParam("include_deleted", "false");
-  }
-
-  if (req.getRev().compare("")) {
-    r->addParam("rev", req.getRev());
-  }
-
-  DropboxErrorCode code = execute(r);
-  if (code != SUCCESS) {
-    return code;
-  }
-
-  string response((char *)r->getResponse(), r->getResponseSize());
-  res.readJson(response);
-
-  return code;
-}
-
-DropboxErrorCode DropboxApi::getRevisions(string path,
-    size_t numRevisions, DropboxRevisions& revs) {
-  stringstream ss;
-
-  ss << "https://api.dropbox.com/1/revisions/" << root_ << "/" << path;
-
-  shared_ptr<HttpRequest> r(httpFactory_->createHttpRequest(ss.str()));
-
-  r->setMethod(HttpGetRequest);
-
-  if (numRevisions) {
-    r->addIntegerParam("rev_limit", numRevisions);
-  }
-
-  DropboxErrorCode code = execute(r);
-  if (code != SUCCESS) {
-    return code;
-  }
-
-  string response((char *)r->getResponse(), r->getResponseSize());
-  revs.readFromJson(response);
-
-  return code;
-}
-
-DropboxErrorCode DropboxApi::restoreFile(string path,
-    string rev, DropboxMetadata& m) {
-  stringstream ss;
-
-  ss << "https://api.dropbox.com/1/restore/" << root_ << "/" << path;
-
-  shared_ptr<HttpRequest> r(httpFactory_->createHttpRequest(ss.str()));
-
+  // Step 1: get_current_account
+  shared_ptr<HttpRequest> r(httpFactory_->createHttpRequest(
+    string(kApiBase) + "/users/get_current_account"));
   r->setMethod(HttpPostRequest);
-  r->addParam("rev", rev);
+  // v2 requires an empty JSON body ("null") for no-arg endpoints
+  r->setJsonBody("null");
 
   DropboxErrorCode code = execute(r);
-  if (code != SUCCESS) {
-    return code;
-  }
+  if (code != SUCCESS) { return code; }
 
-  string response((char *)r->getResponse(), r->getResponseSize());
+  string response((char*)r->getResponse(), r->getResponseSize());
+  info.readJson(response);
 
-  stringstream s;
-  s << response;
+  // Step 2: get_space_usage
+  shared_ptr<HttpRequest> r2(httpFactory_->createHttpRequest(
+    string(kApiBase) + "/users/get_space_usage"));
+  r2->setMethod(HttpPostRequest);
+  r2->setJsonBody("null");
 
-  ptree pt;
-  read_json(s, pt);
+  code = execute(r2);
+  if (code != SUCCESS) { return code; }
 
-  DropboxMetadata::readFromJson(pt, m);
+  string usageResponse((char*)r2->getResponse(), r2->getResponseSize());
+  info.readSpaceUsageJson(usageResponse);
 
-  return code;
+  return SUCCESS;
 }
 
-DropboxErrorCode DropboxApi::deleteFile(string path, DropboxMetadata& m) {
-  shared_ptr<HttpRequest> r(httpFactory_->createHttpRequest(
-    "https://api.dropbox.com/1/fileops/delete"));
-
-  r->addParam("root", root_);
-  r->addParam("path", path);
-
-  DropboxErrorCode code = execute(r);
-  if (code != SUCCESS) {
-    return code;
-  }
-
-  string response((char *)r->getResponse(), r->getResponseSize());
-
-  stringstream s;
-  s << response;
-
-  ptree pt;
-  read_json(s, pt);
-
-  DropboxMetadata::readFromJson(pt, m);
-
-  return code;
-}
-
-DropboxErrorCode DropboxApi::copyOrMove(const string from,
-    const string to,
-    const string op,
-    DropboxMetadata& m) {
-  stringstream ss;
-  ss << "https://api.dropbox.com/1/fileops/" << op;
-
-  shared_ptr<HttpRequest> r(httpFactory_->createHttpRequest(ss.str()));
-
-  r->addParam("root", root_);
-  r->addParam("from_path", from);
-  r->addParam("to_path", to);
-
-  DropboxErrorCode code = execute(r);
-  if (code != SUCCESS) {
-    return code;
-  }
-
-  string response((char *)r->getResponse(), r->getResponseSize());
-
-  stringstream s;
-  s << response;
-
-  ptree pt;
-  read_json(s, pt);
-
-  DropboxMetadata::readFromJson(pt, m);
-
-  return code;
-}
-
-DropboxErrorCode DropboxApi::copyFile(string from,
-    string to,
-    DropboxMetadata& m) {
-  return copyOrMove(from, to, "copy", m);
-}
-
-DropboxErrorCode DropboxApi::moveFile(string from,
-    string to,
-    DropboxMetadata& m) {
-  return copyOrMove(from, to, "move", m);
-}
-
-DropboxErrorCode DropboxApi::createFolder(const string path,
-    DropboxMetadata& m) {
-  shared_ptr<HttpRequest> r(httpFactory_->createHttpRequest(
-    "https://api.dropbox.com/1/fileops/create_folder"));
-
-  r->addParam("root", root_);
-  r->addParam("path", path);
-
-  DropboxErrorCode code = execute(r);
-  if (code != SUCCESS) {
-    return code;
-  }
-
-  string response((char *)r->getResponse(), r->getResponseSize());
-
-  stringstream s;
-  s << response;
-
-  ptree pt;
-  read_json(s, pt);
-
-  DropboxMetadata::readFromJson(pt, m);
-
-  return code;
-}
+// ---------------------------------------------------------------------------
+// File download
+// ---------------------------------------------------------------------------
 
 DropboxErrorCode DropboxApi::getFile(DropboxGetFileRequest& req,
     DropboxGetFileResponse& res) {
-  stringstream ss;
-  ss << "https://api-content.dropbox.com/1/files/" << root_ << "/"
-    << req.getPath();
+  // v2: POST https://content.dropbox.com/2/files/download
+  // Path and rev are passed in the Dropbox-API-Arg header as JSON.
+  shared_ptr<HttpRequest> r(httpFactory_->createHttpRequest(
+    string(kContentBase) + "/files/download"));
+  r->setMethod(HttpPostRequest);
 
-  shared_ptr<HttpRequest> r(httpFactory_->createHttpRequest(ss.str()));
-  if (req.getRev().compare("")) {
-    r->addParam("rev", req.getRev());
+  // Build Dropbox-API-Arg header
+  stringstream arg;
+  arg << "{\"path\":\"" << req.getPath() << "\"";
+  if (!req.getRev().empty()) {
+    arg << ",\"rev\":\"" << req.getRev() << "\"";
   }
+  arg << "}";
+  r->addHeader("Dropbox-API-Arg", arg.str());
+  // Explicitly set empty body (no JSON body for content endpoints)
+  r->addHeader("Content-Type", "");
 
   if (req.hasRange()) {
-    r->addRange(req.getOffset(), req.getOffset() + req.getLength() - 1);
+    std::stringstream rs;
+    rs << "bytes=" << req.getOffset() << "-"
+       << (req.getOffset() + req.getLength() - 1);
+    r->addHeader("Range", rs.str());
   }
 
   DropboxErrorCode code = execute(r);
-  if (code != SUCCESS && code != PARTIAL_CONTENT) {
-    return code;
-  }
+  if (code != SUCCESS && code != PARTIAL_CONTENT) { return code; }
 
   res.setData(r->getResponse(), r->getResponseSize());
 
-  map<string, string> respHeaders = r->getResponseHeaders();
-  res.setMetadata(respHeaders["x-dropbox-metadata"]);
+  // v2 returns metadata in Dropbox-API-Result response header.
+  // Headers are stored lowercase (HTTP/2 normalisation applied in headerFunction).
+  auto respHeaders = r->getResponseHeaders();
+  auto it = respHeaders.find("dropbox-api-result");
+  if (it != respHeaders.end()) {
+    string meta = it->second;
+    // Trim leading whitespace that curl includes after the colon
+    size_t start = meta.find_first_not_of(" \t");
+    if (start != string::npos) { meta = meta.substr(start); }
+    res.setMetadata(meta);
+  }
 
   return code;
 }
+
+// ---------------------------------------------------------------------------
+// Metadata / folder listing
+// ---------------------------------------------------------------------------
+
+DropboxErrorCode DropboxApi::getFileMetadata(DropboxMetadataRequest& req,
+    DropboxMetadataResponse& res) {
+  string endpoint;
+  stringstream body;
+
+  if (req.includeChildren()) {
+    // list_folder
+    endpoint = string(kApiBase) + "/files/list_folder";
+    body << "{"
+         << "\"path\":\""           << req.path()        << "\""
+         << ",\"include_deleted\":" << (req.includeDeleted() ? "true" : "false")
+         << "}";
+  } else {
+    // get_metadata
+    endpoint = string(kApiBase) + "/files/get_metadata";
+    body << "{"
+         << "\"path\":\"" << req.path() << "\""
+         << "}";
+  }
+
+  shared_ptr<HttpRequest> r(httpFactory_->createHttpRequest(endpoint));
+  r->setMethod(HttpPostRequest);
+  r->setJsonBody(body.str());
+
+  DropboxErrorCode code = execute(r);
+  if (code != SUCCESS) { return code; }
+
+  string response((char*)r->getResponse(), r->getResponseSize());
+  res.readJson(response);
+  return code;
+}
+
+// ---------------------------------------------------------------------------
+// Revisions
+// ---------------------------------------------------------------------------
+
+DropboxErrorCode DropboxApi::getRevisions(const string& path,
+    size_t numRevisions, DropboxRevisions& revs) {
+  stringstream body;
+  body << "{\"path\":\"" << path << "\"";
+  if (numRevisions) {
+    body << ",\"limit\":" << numRevisions;
+  }
+  body << "}";
+
+  shared_ptr<HttpRequest> r(httpFactory_->createHttpRequest(
+    string(kApiBase) + "/files/list_revisions"));
+  r->setMethod(HttpPostRequest);
+  r->setJsonBody(body.str());
+
+  DropboxErrorCode code = execute(r);
+  if (code != SUCCESS) { return code; }
+
+  string response((char*)r->getResponse(), r->getResponseSize());
+  revs.readFromJson(response);
+  return code;
+}
+
+// ---------------------------------------------------------------------------
+// Restore
+// ---------------------------------------------------------------------------
+
+DropboxErrorCode DropboxApi::restoreFile(const string& path,
+    const string& rev, DropboxMetadata& m) {
+  stringstream body;
+  body << "{\"path\":\"" << path << "\",\"rev\":\"" << rev << "\"}";
+
+  shared_ptr<HttpRequest> r(httpFactory_->createHttpRequest(
+    string(kApiBase) + "/files/restore"));
+  r->setMethod(HttpPostRequest);
+  r->setJsonBody(body.str());
+
+  DropboxErrorCode code = execute(r);
+  if (code != SUCCESS) { return code; }
+
+  string response((char*)r->getResponse(), r->getResponseSize());
+  stringstream ss;
+  ss << response;
+  ptree pt;
+  read_json(ss, pt);
+  DropboxMetadata::readFromJson(pt, m);
+  return code;
+}
+
+// ---------------------------------------------------------------------------
+// Delete
+// ---------------------------------------------------------------------------
+
+DropboxErrorCode DropboxApi::deleteFile(const string& path, DropboxMetadata& m) {
+  stringstream body;
+  body << "{\"path\":\"" << path << "\"}";
+
+  shared_ptr<HttpRequest> r(httpFactory_->createHttpRequest(
+    string(kApiBase) + "/files/delete_v2"));
+  r->setMethod(HttpPostRequest);
+  r->setJsonBody(body.str());
+
+  DropboxErrorCode code = execute(r);
+  if (code != SUCCESS) { return code; }
+
+  string response((char*)r->getResponse(), r->getResponseSize());
+  // delete_v2 wraps metadata under "metadata" key
+  parseWrappedMetadata(response, "metadata", m);
+  return code;
+}
+
+// ---------------------------------------------------------------------------
+// Copy / Move (shared helper)
+// ---------------------------------------------------------------------------
+
+DropboxErrorCode DropboxApi::copyOrMove(const string& from,
+    const string& to, const string& endpoint, DropboxMetadata& m) {
+  stringstream body;
+  body << "{\"from_path\":\"" << from << "\",\"to_path\":\"" << to << "\"}";
+
+  shared_ptr<HttpRequest> r(httpFactory_->createHttpRequest(
+    string(kApiBase) + "/files/" + endpoint));
+  r->setMethod(HttpPostRequest);
+  r->setJsonBody(body.str());
+
+  DropboxErrorCode code = execute(r);
+  if (code != SUCCESS) { return code; }
+
+  string response((char*)r->getResponse(), r->getResponseSize());
+  // copy_v2 / move_v2 wrap metadata under "metadata" key
+  parseWrappedMetadata(response, "metadata", m);
+  return code;
+}
+
+DropboxErrorCode DropboxApi::copyFile(const string& from,
+    const string& to, DropboxMetadata& m) {
+  return copyOrMove(from, to, "copy_v2", m);
+}
+
+DropboxErrorCode DropboxApi::moveFile(const string& from,
+    const string& to, DropboxMetadata& m) {
+  return copyOrMove(from, to, "move_v2", m);
+}
+
+// ---------------------------------------------------------------------------
+// Create folder
+// ---------------------------------------------------------------------------
+
+DropboxErrorCode DropboxApi::createFolder(const string& path, DropboxMetadata& m) {
+  stringstream body;
+  body << "{\"path\":\"" << path << "\",\"autorename\":false}";
+
+  shared_ptr<HttpRequest> r(httpFactory_->createHttpRequest(
+    string(kApiBase) + "/files/create_folder_v2"));
+  r->setMethod(HttpPostRequest);
+  r->setJsonBody(body.str());
+
+  DropboxErrorCode code = execute(r);
+  if (code != SUCCESS) { return code; }
+
+  string response((char*)r->getResponse(), r->getResponseSize());
+  // create_folder_v2 wraps metadata under "metadata" key.
+  // Note: the response FolderMetadata does not include ".tag", so we set
+  // isDir_/tag_ explicitly after parsing (the endpoint always returns a folder).
+  parseWrappedMetadata(response, "metadata", m);
+  m.tag_     = "folder";
+  m.isDir_   = true;
+  m.isDeleted_ = false;
+  return code;
+}
+
+// ---------------------------------------------------------------------------
+// Upload (small file)
+// ---------------------------------------------------------------------------
 
 DropboxErrorCode DropboxApi::uploadFile(const DropboxUploadFileRequest& req,
     DropboxMetadata& m) {
-  stringstream ss;
-  ss << "https://api-content.dropbox.com/1/files_put/" << root_ << "/"
-    << req.getPath();
-
-  shared_ptr<HttpRequest> r(httpFactory_->createHttpRequest(ss.str()));
-  r->setMethod(HttpPutRequest);
-
-  if (req.shouldOverwrite()) {
-    r->addParam("overwrite", "true");
+  // Determine upload mode and autorename setting
+  string mode;
+  bool autorename = false;
+  if (!req.getParentRev().empty()) {
+    // Update a specific revision
+    mode = string("{\".\\.tag\":\"update\",\"update\":\"") +
+           req.getParentRev() + "\"}";
+  } else if (req.shouldOverwrite()) {
+    mode = "\"overwrite\"";
   } else {
-    r->addParam("overwrite", "false");
+    // "add" mode: if the file already exists Dropbox will auto-rename it
+    mode = "\"add\"";
+    autorename = true;
   }
 
-  if (req.getParentRev().compare("")) {
-    r->addParam("parent_rev", req.getParentRev());
-  }
+  // Build Dropbox-API-Arg header
+  stringstream arg;
+  arg << "{\"path\":\"" << req.getPath() << "\""
+      << ",\"mode\":"  << mode
+      << ",\"autorename\":" << (autorename ? "true" : "false")
+      << "}";
+
+  shared_ptr<HttpRequest> r(httpFactory_->createHttpRequest(
+    string(kContentBase) + "/files/upload"));
+  r->setMethod(HttpPostRequest);
+  r->addHeader("Dropbox-API-Arg",  arg.str());
+  r->addHeader("Content-Type",     "application/octet-stream");
 
   assert(req.getUploadData());
-
   r->setRequestData(req.getUploadData(), req.getUploadDataSize());
 
   DropboxErrorCode code = execute(r);
+  if (code != SUCCESS) { return code; }
 
-  if (code != SUCCESS) {
-    return code;
-  }
-
-  string response((char *)r->getResponse(), r->getResponseSize());
-
-  stringstream s;
-  s << response;
-
+  string response((char*)r->getResponse(), r->getResponseSize());
+  stringstream ss;
+  ss << response;
   ptree pt;
-  read_json(s, pt);
-
+  read_json(ss, pt);
   DropboxMetadata::readFromJson(pt, m);
-
   return code;
 }
+
+// ---------------------------------------------------------------------------
+// Upload (large file – upload session)
+// ---------------------------------------------------------------------------
 
 DropboxErrorCode DropboxApi::uploadLargeFile(
     const DropboxUploadLargeFileRequest& req,
     DropboxMetadata& m) {
-  string uploadId = "";
+  string sessionId;
   size_t offset = req.getOffset();
-  size_t size = 0;
+  size_t size   = 0;
+
   unique_ptr<uint8_t, void(*)(void*)> data(
-    (uint8_t*)malloc(req.getChunkSize()), free);
+    static_cast<uint8_t*>(malloc(req.getChunkSize())), free);
+  if (!data) { throw std::bad_alloc(); }
 
-  if (!data.get()) {
-    throw std::bad_alloc();
-  }
-
-  do {
+  // ------------------------------------------------------------------
+  // Phase 1: upload_session/start  (first chunk)
+  // ------------------------------------------------------------------
+  size = req.getData(data.get(), offset, req.getChunkSize());
+  if (size > 0) {
     shared_ptr<HttpRequest> r(httpFactory_->createHttpRequest(
-      "https://api-content.dropbox.com/1/chunked_upload"));
-    r->setMethod(HttpPutRequest);
-    r->addIntegerParam("offset", offset);
-
-    if (uploadId.compare("")) {
-      r->addParam("upload_id", uploadId);
-    }
-
-    size = req.getData(data.get(), offset, req.getChunkSize());
-    if (!size) {
-      continue;
-    }
-
-    if (size < 0) {
-      throw DropboxException(IO_ERROR, "Error receiving file data");
-    }
-
+      string(kContentBase) + "/files/upload_session/start"));
+    r->setMethod(HttpPostRequest);
+    r->addHeader("Dropbox-API-Arg",
+      string("{\"close\":") + (size < req.getChunkSize() ? "true" : "false") + "}");
+    r->addHeader("Content-Type", "application/octet-stream");
     r->setRequestData(data.get(), size);
 
     DropboxErrorCode code = execute(r);
-    if (code != SUCCESS) {
-      return code;
+    if (code != SUCCESS) { return code; }
+
+    string response((char*)r->getResponse(), r->getResponseSize());
+    auto cursor = DropboxUploadSessionCursor::readFromJson(response);
+    sessionId = cursor.getSessionId();
+    offset   += size;
+  }
+
+  // ------------------------------------------------------------------
+  // Phase 2: upload_session/append_v2  (subsequent chunks)
+  // ------------------------------------------------------------------
+  while ((size = req.getData(data.get(), offset, req.getChunkSize())) > 0) {
+    if (static_cast<ssize_t>(size) < 0) {
+      throw DropboxException(IO_ERROR, "Error reading file data");
     }
 
-    string response((char *)r->getResponse(), r->getResponseSize());
+    bool isLast = (size < req.getChunkSize());
 
-    DropboxUploadLargeFileResponse res =
-      DropboxUploadLargeFileResponse::readFromJson(response);
-    uploadId = res.getUploadId();
-    offset = res.getOffset();
-  } while (size != 0);
+    stringstream arg;
+    arg << "{"
+        << "\"cursor\":{\"session_id\":\"" << sessionId
+        <<              "\",\"offset\":"   << offset << "}"
+        << ",\"close\":"                   << (isLast ? "true" : "false")
+        << "}";
 
-  stringstream ss;
-  ss << "https://api-content.dropbox.com/1/commit_chunked_upload/" << root_
-    << "/" << req.getPath();
+    shared_ptr<HttpRequest> r(httpFactory_->createHttpRequest(
+      string(kContentBase) + "/files/upload_session/append_v2"));
+    r->setMethod(HttpPostRequest);
+    r->addHeader("Dropbox-API-Arg",  arg.str());
+    r->addHeader("Content-Type",     "application/octet-stream");
+    r->setRequestData(data.get(), size);
 
-  shared_ptr<HttpRequest> r(httpFactory_->createHttpRequest(ss.str()));
-  r->setMethod(HttpPostRequest);
+    DropboxErrorCode code = execute(r);
+    if (code != SUCCESS) { return code; }
 
-  if (req.shouldOverwrite()) {
-    r->addParam("overwrite", "true");
+    offset += size;
+  }
+
+  // ------------------------------------------------------------------
+  // Phase 3: upload_session/finish  (commit)
+  // ------------------------------------------------------------------
+  string mode;
+  if (!req.getParentRev().empty()) {
+    mode = string("{\".\\.tag\":\"update\",\"update\":\"") +
+           req.getParentRev() + "\"}";
+  } else if (req.shouldOverwrite()) {
+    mode = "\"overwrite\"";
   } else {
-    r->addParam("overwrite", "false");
+    mode = "\"add\"";
   }
 
-  if (req.getParentRev().compare("")) {
-    r->addParam("parent_rev", req.getParentRev());
-  }
+  stringstream finishArg;
+  finishArg << "{"
+            << "\"cursor\":{\"session_id\":\"" << sessionId
+            <<              "\",\"offset\":"   << offset << "}"
+            << ",\"commit\":{"
+            <<   "\"path\":\""  << req.getPath() << "\""
+            <<   ",\"mode\":"   << mode
+            <<   ",\"autorename\":false"
+            << "}"
+            << "}";
 
-  r->addParam("upload_id", uploadId);
+  shared_ptr<HttpRequest> rf(httpFactory_->createHttpRequest(
+    string(kContentBase) + "/files/upload_session/finish"));
+  rf->setMethod(HttpPostRequest);
+  rf->addHeader("Dropbox-API-Arg",  finishArg.str());
+  rf->addHeader("Content-Type",     "application/octet-stream");
+  // finish endpoint requires an empty body
+  uint8_t empty = 0;
+  rf->setRequestData(&empty, 0);
 
-  DropboxErrorCode code = execute(r);
-  if (code != SUCCESS) {
-    return code;
-  }
+  DropboxErrorCode code = execute(rf);
+  if (code != SUCCESS) { return code; }
 
-  string response((char *)r->getResponse(), r->getResponseSize());
-
-  stringstream s;
-  s << response;
-
+  string response((char*)rf->getResponse(), rf->getResponseSize());
+  stringstream ss;
+  ss << response;
   ptree pt;
-  read_json(s, pt);
-
+  read_json(ss, pt);
   DropboxMetadata::readFromJson(pt, m);
-
   return code;
 }
 
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+
 DropboxErrorCode DropboxApi::search(const DropboxSearchRequest& req,
     DropboxSearchResult& res) {
-  stringstream ss;
-  ss << "https://api.dropbox.com/1/search/" << root_ << "/"
-    << req.getSearchPath();
+  // Build options sub-object
+  stringstream body;
+  body << "{"
+       << "\"query\":\"" << req.getSearchQuery() << "\""
+       << ",\"options\":{"
+       <<   "\"path\":\""        << req.getSearchPath()  << "\""
+       <<   ",\"max_results\":"  << req.getResultLimit()
+       <<   ",\"include_highlights\":false"
+       << "}"
+       << "}";
 
-  shared_ptr<HttpRequest> r(httpFactory_->createHttpRequest(ss.str()));
-
-  r->addParam("query", req.getSearchQuery());
-  r->addIntegerParam("file_limit", req.getResultLimit());
-
-  if (req.shouldIncludeDeleted()) {
-    r->addParam("include_deleted", "true");
-  } else {
-    r->addParam("include_deleted", "false");
-  }
+  shared_ptr<HttpRequest> r(httpFactory_->createHttpRequest(
+    string(kApiBase) + "/files/search_v2"));
+  r->setMethod(HttpPostRequest);
+  r->setJsonBody(body.str());
 
   DropboxErrorCode code = execute(r);
+  if (code != SUCCESS) { return code; }
 
-  if (code != SUCCESS) {
-    return code;
-  }
-
-  string response((char *)r->getResponse(), r->getResponseSize());
+  string response((char*)r->getResponse(), r->getResponseSize());
   res = DropboxSearchResult::readFromJson(response);
 
   return code;

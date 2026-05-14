@@ -1,11 +1,21 @@
 #!/bin/sh
+#
+# Integration test runner for dropbox-cpp (Dropbox API v2).
+#
+# 1. Fill in DROPBOX_API_KEY and DROPBOX_API_SECRET (from the App Console).
+# 2. Optionally set DROPBOX_ACCESS_TOKEN to skip the interactive auth step.
+#    If left empty the test suite will print a URL; visit it in a browser,
+#    authorize the app, and paste the authorization code into the terminal.
+# 3. Set DROPBOX_ACCOUNT_NAME and DROPBOX_ACCOUNT_EMAIL to the values shown
+#    on https://www.dropbox.com/account/info – used by AccountInfoTest.
+#
+# NOTE: DROPBOX_AUTH_TOKEN_SECRET is no longer needed (OAuth 2.0 Bearer tokens
+#       have no separate secret).
 
-export DROPBOX_API_KEY=""
-export DROPBOX_API_SECRET=""
-export DROPBOX_AUTH_TOKEN=""
-export DROPBOX_AUTH_TOKEN_SECRET=""
-export DROPBOX_ACCOUNT_NAME=""
-export DROPBOX_ACCOUNT_EMAIL=""
+export DROPBOX_API_KEY="${DROPBOX_API_KEY:-}"
+export DROPBOX_API_SECRET="${DROPBOX_API_SECRET:-}"
+export DROPBOX_ACCESS_TOKEN="${DROPBOX_ACCESS_TOKEN:-}"   # leave empty for interactive auth
+export DROPBOX_ACCOUNT_NAME="${DROPBOX_ACCOUNT_NAME:-}"
+export DROPBOX_ACCOUNT_EMAIL="${DROPBOX_ACCOUNT_EMAIL:-}"
 
 ./tester
-

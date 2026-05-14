@@ -24,6 +24,17 @@ using namespace std;
 using namespace boost::property_tree;
 using namespace boost::property_tree::json_parser;
 
+/**
+ * Parse /2/files/list_revisions response.
+ *
+ * v2 format:
+ * {
+ *   "is_deleted": false,
+ *   "entries": [ <metadata>, ... ]
+ * }
+ *
+ * (v1 returned a bare JSON array; v2 wraps it in "entries".)
+ */
 void DropboxRevisions::readFromJson(string& json) {
   try {
     stringstream ss;
@@ -32,10 +43,10 @@ void DropboxRevisions::readFromJson(string& json) {
     ptree pt;
     read_json(ss, pt);
 
-    BOOST_FOREACH(ptree::value_type& v, pt) {
+    auto& entries = pt.get_child("entries");
+    BOOST_FOREACH(ptree::value_type& v, entries) {
       DropboxMetadata m;
       DropboxMetadata::readFromJson(v.second, m);
-
       revisions_.push_back(m);
     }
   } catch (exception& e) {

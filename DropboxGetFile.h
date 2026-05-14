@@ -77,6 +77,14 @@ public:
     length_ = len;
   }
 
+  /**
+   * Parse the file metadata from the Dropbox-API-Result response header
+   * (Dropbox API v2 content endpoints).
+   *
+   * v1 used the x-dropbox-metadata header; v2 uses Dropbox-API-Result.
+   * The header value is a JSON-encoded metadata object identical to the
+   * response body of /2/files/get_metadata.
+   */
   void setMetadata(std::string& s) {
     using namespace boost::property_tree;
     using namespace boost::property_tree::json_parser;

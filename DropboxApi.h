@@ -16,7 +16,7 @@
 #ifndef __DROPBOX_API_H__
 #define __DROPBOX_API_H__
 
-#include "util/OAuth.h"
+#include "util/DropboxAuth.h"
 #include "util/HttpRequestFactory.h"
 #include "util/HttpRequest.h"
 
@@ -35,251 +35,141 @@
 
 namespace dropbox {
 
-#define DROPBOX_ROOT "dropbox"
-#define SANDBOX_ROOT "sandbox"
-
 class DropboxApi {
 public:
   /**
-   * Create an instance of the Dropbox API class
+   * Create a DropboxApi instance without a pre-existing access token.
+   * Call authenticate() to obtain one before making API calls.
    *
-   * @param appKey        Your app key
-   * @param appSecret     Your app secret
+   * @param clientId      Your Dropbox app key.
+   * @param clientSecret  Your Dropbox app secret.
    */
-  DropboxApi(const std::string appKey, const std::string appSecret);
+  DropboxApi(const std::string& clientId, const std::string& clientSecret);
 
   /**
-   * Create an instance of the Dropbox API class with an access token
+   * Create a DropboxApi instance with a pre-existing access token.
+   * The token is used immediately without requiring authenticate().
    *
-   * @param appKey        Your app key
-   * @param appSecret     Your app secret
-   * @param accessToken   Access token for the user's account
-   * @param tokenSecret   Access token secret for the user's account
+   * @param clientId      Your Dropbox app key.
+   * @param clientSecret  Your Dropbox app secret.
+   * @param accessToken   A previously obtained OAuth 2.0 Bearer token.
    */
-  DropboxApi(const std::string appKey,
-    const std::string appSecret,
-    const std::string accessToken,
-    const std::string tokenSecret);
+  DropboxApi(const std::string& clientId,
+    const std::string& clientSecret,
+    const std::string& accessToken);
 
   /**
-   * Get an access token and an access token secret for the given user
+   * Interactive OAuth 2.0 authorization code flow.
    *
-   * @param cb            Callback function to be called to authorize the
-   *                      request token. The request token and request token
-   *                      secret are passed as arguments to the callback
+   * The callback receives the authorization URL.  It should display the URL
+   * to the user and return the authorization code the user receives after
+   * granting access (from the redirect URI query param or the Dropbox
+   * "show code" page).
    *
-   * @return void
+   * @param cb  Called with the auth URL; must return the authorization code.
    */
-  void authenticate(std::function<void(const std::string reqToken,
-    const std::string reqSecret)>);
+  void authenticate(std::function<std::string(const std::string& authUrl)> cb);
 
   /**
-   * Set the access token and access token secret if you already have one
+   * Set a pre-existing access token.
    *
-   * @param token         The access token
-   * @param secret        The access token secret
-   *
-   * @return void
+   * @param token  OAuth 2.0 Bearer token.
    */
-  void setAccessToken(std::string token, std::string secret);
+  void setAccessToken(const std::string& token);
+
+  /** Return the current access token. */
+  std::string getAccessToken() const;
 
   /**
-   * Get the access token for the user
-   * @param none
+   * Set a refresh token to enable automatic token renewal.
    *
-   * @return access token
+   * @param token  OAuth 2.0 refresh token.
    */
-  std::string getAccessToken();
+  void setRefreshToken(const std::string& token);
 
-  /**
-   * Get the access token secret for the user
-   * @param none
-   *
-   * @return access token secret
-   */
-  std::string getAccessTokenSecret();
+  /** Return the current refresh token (empty if none). */
+  std::string getRefreshToken() const;
 
+  // -------------------------------------------------------------------------
+  // Core API methods
+  // -------------------------------------------------------------------------
   /**
-   * Set the root directory for the client. Valid values are DROPBOX_ROOT and
-   * SANDBOX_ROOT.
-   *
-   * @param root            The root directory
-   *
-   * @return void
-   */
-  void setRoot(const std::string);
-
-  /**
-   * Get account info for the user. This method calls the /account/info method
-   * of the core API.
-   *
-   * @param info            Output param in which the account info is returned
-   *
-   * @return Error code for the operation. See DropboxErrorCode for values
+   * Get account info for the authenticated user.
+   * Internally calls both /2/users/get_current_account and
+   * /2/users/get_space_usage to populate all DropboxAccountInfo fields.
    */
   DropboxErrorCode getAccountInfo(DropboxAccountInfo& info);
 
-  /**
-   * Get file data. This method calls the /files (GET) method of the core API
-   *
-   * @param req             DropboxGetFileRequest object containing request
-   *                        params
-   * @param res             Output parameter; an object of type
-   *                        DropboxGetFileResponse that has the response
-   *
-   * @return Error code for the operation. See DropboxErrorCode for values
-   */
+  /** Download a file.  Maps to /2/files/download. */
   DropboxErrorCode getFile(DropboxGetFileRequest& req,
     DropboxGetFileResponse& res);
 
   /**
-   * Get the metadata for a file. This call can also be used to get the
-   * children if the specified file is a directory. This method calls the
-   * /metadata method of the core API.
-   *
-   * @param req             An object of type DropboxMetadataRequest that has
-   *                        the params for the request
-   * @param res             Output param of type DropboxMetadataResponse that
-   *                        holds the result
-   *
-   * @return Error code for the operation. See DropboxErrorCode for values
+   * Get metadata for a file or folder.
+   * - If req.includeChildren() is false: calls /2/files/get_metadata.
+   * - If req.includeChildren() is true:  calls /2/files/list_folder.
+   *   Note: only the first page of results is returned.
    */
   DropboxErrorCode getFileMetadata(DropboxMetadataRequest& req,
     DropboxMetadataResponse& res);
 
-  /**
-   * Get the revisions for a file. This method calls the /revisions method of
-   * the core API.
-   *
-   * @param path            Path of the file relative to the root
-   * @param numRevisions    Number of revisions desired. Max is 1000;
-   *                        default is 10
-   * @param revs            Output param of type DropboxRevisions that holds
-   *                        the result
-   *
-   * @return Error code for the operation. See DropboxErrorCode for values
-   */
-  DropboxErrorCode getRevisions(std::string path,
+  /** Get file revisions.  Maps to /2/files/list_revisions. */
+  DropboxErrorCode getRevisions(const std::string& path,
     size_t numRevisions,
     DropboxRevisions& revs);
 
-  /**
-   * Restore a file to a given revision. This method calls the /restore method
-   * of the core API.
-   *
-   * @param path            Path of the file relative to the root
-   * @param rev             The id of the revision to restore the file to
-   * @param m               Output param of type DropboxMetadata that holds the
-   *                        metadata of the revision restored to.
-   *
-   * @return Error code for the operation. See DropboxErrorCode for values
-   */
-  DropboxErrorCode restoreFile(std::string path, std::string rev,
+  /** Restore a file to a given revision.  Maps to /2/files/restore. */
+  DropboxErrorCode restoreFile(const std::string& path,
+    const std::string& rev,
     DropboxMetadata& m);
 
-  /**
-   * Delete a given file or directory. This method calls the /delete method of
-   * the core API.
-   *
-   * @param path            Path of the file relative to the root
-   * @param m               Output param of type DropboxMetadata that holds the
-   *                        metadata of the file that was deleted
-   *
-   * @return Error code for the operation. See DropboxErrorCode for values
-   */
-  DropboxErrorCode deleteFile(std::string path, DropboxMetadata& m);
+  /** Delete a file or folder.  Maps to /2/files/delete_v2. */
+  DropboxErrorCode deleteFile(const std::string& path, DropboxMetadata& m);
 
-  /**
-   * Make a copy of a file. This method calls the /copy method of the core API
-   *
-   * @param from            The path of the source file relative to root
-   * @param to              The path of the destination file relative to root
-   * @param m               Output param of type DropboxMetadata that contains
-   *                        the metadata of the destination file
-   *
-   * @return Error code for the operation. See DropboxErrorCode for values
-   */
-  DropboxErrorCode copyFile(std::string from, std::string to,
+  /** Copy a file or folder.  Maps to /2/files/copy_v2. */
+  DropboxErrorCode copyFile(const std::string& from, const std::string& to,
     DropboxMetadata& m);
 
-  /**
-   * Move a file or directory. This method calls the /move method in the core
-   * API.
-   *
-   * @param from            The path of the source file relative to root
-   * @param to              The path of the destination file relative to root
-   * @param m               Output param of type DropboxMetadata that contains
-   *                        the metadata of the destination file
-   *
-   * @return Error code for the operation. See DropboxErrorCode for values
-   */
-  DropboxErrorCode moveFile(std::string from, std::string to,
+  /** Move a file or folder.  Maps to /2/files/move_v2. */
+  DropboxErrorCode moveFile(const std::string& from, const std::string& to,
     DropboxMetadata& m);
 
-  /**
-   * Create a folder. This method calls the /create_folder method of the core
-   * API.
-   *
-   * @param path            Path of the folder relative to root
-   * @param m               Output param of type DropboxMetadata that contains
-   *                        the metadata of the folder created
-   *
-   * @return Error code for the operation. See DropboxErrorCode for values
-   */
-  DropboxErrorCode createFolder(const std::string path, DropboxMetadata& m);
+  /** Create a folder.  Maps to /2/files/create_folder_v2. */
+  DropboxErrorCode createFolder(const std::string& path, DropboxMetadata& m);
 
-  /**
-   * Upload a file. This calls the /files_put method of the core API.
-   *
-   * @param req             Object of type DropboxUploadFileRequest that
-   *                        contains the params for the request
-   * @param res             Output param of type DropboxMetadata that contains
-   *                        the metadata of the uploaded file
-   *
-   * @return Error code for the operation. See DropboxErrorCode for values
-   */
+  /** Upload a small file (< 150 MB).  Maps to /2/files/upload. */
   DropboxErrorCode uploadFile(const DropboxUploadFileRequest& req,
     DropboxMetadata& res);
 
   /**
-   * Upload a large file. Dropbox defines "large" to be files greater than
-   * 150 MB in size. This uses the /chunked_upload and /commit_chunked_upload
-   * methods of the core API
-   *
-   * @param req             Object of type DropboxUploadLargeFileRequest that
-   *                        contains the params for the request
-   * @param res             Output param of type DropboxMetadata that contains
-   *                        the metadata of the uploaded file
-   *
-   * @return Error code for the operation. See DropboxErrorCode for values
+   * Upload a large file using the upload-session protocol.
+   * Maps to /2/files/upload_session/start + append_v2 + finish.
    */
   DropboxErrorCode uploadLargeFile(const DropboxUploadLargeFileRequest& req,
     DropboxMetadata& res);
 
-  /**
-   * Search for files matching a given string pattern. This calls the /search
-   * method in the core API.
-   *
-   * @param req             An object of type DropboxSearchRequest that contains
-   *                        the params of for the search request
-   * @param res             Output param of type DropboxSearchResult that has
-   *                        the search results
-   *
-   * @return Error code for the operation. See DropboxErrorCode for values
-   */
+  /** Search for files.  Maps to /2/files/search_v2. */
   DropboxErrorCode search(const DropboxSearchRequest&, DropboxSearchResult&);
 
 private:
-  DropboxErrorCode  copyOrMove(const std::string,
-    const std::string,
-    const std::string,
-    DropboxMetadata&);
-  DropboxErrorCode  execute(std::shared_ptr<http::HttpRequest>);
+  /** Helper: copy or move (shared logic for copyFile / moveFile). */
+  DropboxErrorCode copyOrMove(const std::string& from,
+    const std::string& to,
+    const std::string& endpoint,
+    DropboxMetadata& m);
 
-  std::string                     root_;
-  std::mutex                      stateLock_;
-  std::unique_ptr<oauth::OAuth>   oauth_;
-  http::HttpRequestFactory*       httpFactory_;
+  /** Execute a prepared request, adding the Bearer auth header. */
+  DropboxErrorCode execute(std::shared_ptr<http::HttpRequest> r);
+
+  /** Parse a v2 response that wraps the result metadata in a sub-key. */
+  static void parseWrappedMetadata(const std::string& json,
+    const std::string& key,
+    DropboxMetadata& m);
+
+  mutable std::mutex                stateLock_;
+  std::unique_ptr<DropboxAuth>      auth_;
+  http::HttpRequestFactory*         httpFactory_;
 };
-}
+
+} // namespace dropbox
 #endif

@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            libcurl4-openssl-dev \
+            libboost-all-dev \
+            libgtest-dev
+
+      - name: Configure (CMake)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build unit_test
+        run: cmake --build build --target unit_test -- -j$(nproc)
+
+      - name: Run unit tests
+        run: ./build/unit_test
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    # Nur ausführen wenn die Secrets vorhanden sind (d.h. kein Fork-PR ohne Secrets)
+    if: ${{ secrets.DROPBOX_API_KEY != '' && secrets.DROPBOX_API_SECRET != '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            libcurl4-openssl-dev \
+            libboost-all-dev \
+            libgtest-dev
+
+      - name: Configure (CMake)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build tester
+        run: cmake --build build --target tester -- -j$(nproc)
+
+      - name: Run integration tests via runtest.sh
+        env:
+          DROPBOX_API_KEY: ${{ secrets.DROPBOX_API_KEY }}
+          DROPBOX_API_SECRET: ${{ secrets.DROPBOX_API_SECRET }}
+          DROPBOX_ACCESS_TOKEN: ${{ secrets.DROPBOX_ACCESS_TOKEN }}
+          DROPBOX_ACCOUNT_NAME: ${{ secrets.DROPBOX_ACCOUNT_NAME }}
+          DROPBOX_ACCOUNT_EMAIL: ${{ secrets.DROPBOX_ACCOUNT_EMAIL }}
+        run: |
+          cp runtest.sh.skeleton build/runtest.sh
+          chmod +x build/runtest.sh
+          cd build && ./runtest.sh
