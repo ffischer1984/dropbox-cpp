@@ -242,9 +242,6 @@ int HttpRequest::execute() {
         return ret;
       }
 
-      if ((ret = curl_easy_setopt(curl_.get(), CURLOPT_PUT, 1L))) {
-        return ret;
-      }
 
       if ((ret = curl_easy_setopt(curl_.get(),
           CURLOPT_READDATA,
