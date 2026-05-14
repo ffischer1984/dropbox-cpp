@@ -34,8 +34,6 @@ jobs:
 
   integration-tests:
     runs-on: ubuntu-latest
-    # Nur ausführen wenn die Secrets vorhanden sind (d.h. kein Fork-PR ohne Secrets)
-    if: ${{ secrets.DROPBOX_API_KEY != '' && secrets.DROPBOX_API_SECRET != '' }}
 
     steps:
       - name: Checkout
